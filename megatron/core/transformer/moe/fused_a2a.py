@@ -6,7 +6,7 @@
 import os
 from typing import Optional
 
-from megatron.core.utils import internal_api
+from megatron.core.utils import internal_api, nvtx_range_pop, nvtx_range_push
 
 try:
     from deep_ep import Buffer
@@ -89,42 +89,58 @@ class FusedDispatch(torch.autograd.Function):
             previous_event = EventOverlap(EventHandle())
         # Calculate layout before actual dispatch
         buffer = get_buffer(group, get_hidden_bytes(x))
-        (
-            num_tokens_per_rank,
-            num_tokens_per_rdma_rank,
-            num_tokens_per_expert,
-            is_token_in_rank,
-            event,
-        ) = buffer.get_dispatch_layout(
-            token_indices,
-            num_experts,
-            previous_event=previous_event,
-            async_finish=async_finish,
-            allocate_on_comm_stream=allocate_on_comm_stream,
+        nvtx_msg = (
+            "moe.deepep.dispatch.get_dispatch_layout."
+            f"input_shape={tuple(x.shape)}.group_size={group.size()}"
         )
+        nvtx_range_push(nvtx_msg)
+        try:
+            (
+                num_tokens_per_rank,
+                num_tokens_per_rdma_rank,
+                num_tokens_per_expert,
+                is_token_in_rank,
+                event,
+            ) = buffer.get_dispatch_layout(
+                token_indices,
+                num_experts,
+                previous_event=previous_event,
+                async_finish=async_finish,
+                allocate_on_comm_stream=allocate_on_comm_stream,
+            )
+        finally:
+            nvtx_range_pop(nvtx_msg)
 
         # Do MoE dispatch
         # NOTES: the CPU will wait for GPU's signal to arrive,
         # so this is not compatible with CUDA graph
-        (
-            recv_x,
-            recv_token_indices,
-            recv_token_probs,
-            num_recv_tokens_per_expert_list,
-            handle,
-            after_event_overlap,
-        ) = buffer.dispatch(
-            x,
-            topk_idx=token_indices,
-            topk_weights=token_probs,  # DeepEP only supports float32 probs
-            num_tokens_per_rank=num_tokens_per_rank,
-            num_tokens_per_rdma_rank=num_tokens_per_rdma_rank,
-            is_token_in_rank=is_token_in_rank,
-            num_tokens_per_expert=num_tokens_per_expert,
-            previous_event=event,  # wait in deepep::intra/inter_dispatch
-            async_finish=async_finish,
-            allocate_on_comm_stream=allocate_on_comm_stream,
+        nvtx_msg = (
+            "moe.deepep.dispatch.buffer_dispatch."
+            f"input_shape={tuple(x.shape)}.group_size={group.size()}"
         )
+        nvtx_range_push(nvtx_msg)
+        try:
+            (
+                recv_x,
+                recv_token_indices,
+                recv_token_probs,
+                num_recv_tokens_per_expert_list,
+                handle,
+                after_event_overlap,
+            ) = buffer.dispatch(
+                x,
+                topk_idx=token_indices,
+                topk_weights=token_probs,  # DeepEP only supports float32 probs
+                num_tokens_per_rank=num_tokens_per_rank,
+                num_tokens_per_rdma_rank=num_tokens_per_rdma_rank,
+                is_token_in_rank=is_token_in_rank,
+                num_tokens_per_expert=num_tokens_per_expert,
+                previous_event=event,  # wait in deepep::intra/inter_dispatch
+                async_finish=async_finish,
+                allocate_on_comm_stream=allocate_on_comm_stream,
+            )
+        finally:
+            nvtx_range_pop(nvtx_msg)
 
         # Make sure current stream is synchronized
         if async_finish:
@@ -149,14 +165,23 @@ class FusedDispatch(torch.autograd.Function):
         previous_event = None
         if ctx.async_finish:
             previous_event = EventOverlap(EventHandle())
-        grad_x, grad_token_probs, after_event = buffer.combine(
-            grad_output.contiguous(),
-            handle,
-            topk_weights=grad_token_probs.float(),
-            previous_event=previous_event,
-            async_finish=ctx.async_finish,
-            allocate_on_comm_stream=ctx.allocate_on_comm_stream,
+        grad_output = grad_output.contiguous()
+        nvtx_msg = (
+            "moe.deepep.dispatch_backward.buffer_combine."
+            f"input_shape={tuple(grad_output.shape)}.group_size={ctx.group.size()}"
         )
+        nvtx_range_push(nvtx_msg)
+        try:
+            grad_x, grad_token_probs, after_event = buffer.combine(
+                grad_output,
+                handle,
+                topk_weights=grad_token_probs.float(),
+                previous_event=previous_event,
+                async_finish=ctx.async_finish,
+                allocate_on_comm_stream=ctx.allocate_on_comm_stream,
+            )
+        finally:
+            nvtx_range_pop(nvtx_msg)
         # Make sure current stream is synchronized
         if ctx.async_finish:
             after_event.current_stream_wait()
@@ -173,13 +198,21 @@ class FusedCombine(torch.autograd.Function):
         if async_finish:
             previous_event = EventOverlap(EventHandle())
         buffer = get_buffer(group, get_hidden_bytes(x))
-        combined_x, _, after_event = buffer.combine(
-            x,
-            handle=handle,
-            async_finish=async_finish,
-            previous_event=previous_event,
-            allocate_on_comm_stream=allocate_on_comm_stream,
+        nvtx_msg = (
+            "moe.deepep.combine.buffer_combine."
+            f"input_shape={tuple(x.shape)}.group_size={group.size()}"
         )
+        nvtx_range_push(nvtx_msg)
+        try:
+            combined_x, _, after_event = buffer.combine(
+                x,
+                handle=handle,
+                async_finish=async_finish,
+                previous_event=previous_event,
+                allocate_on_comm_stream=allocate_on_comm_stream,
+            )
+        finally:
+            nvtx_range_pop(nvtx_msg)
         # Make sure current stream is synchronized
         if async_finish:
             after_event.current_stream_wait()
@@ -197,13 +230,22 @@ class FusedCombine(torch.autograd.Function):
         if ctx.async_finish:
             previous_event = EventOverlap(EventHandle())
         buffer = get_buffer(ctx.group, get_hidden_bytes(grad_output))
-        grad_x, _, _, _, _, after_event = buffer.dispatch(
-            grad_output.contiguous(),
-            handle=ctx.handle,
-            previous_event=previous_event,
-            async_finish=ctx.async_finish,
-            allocate_on_comm_stream=ctx.allocate_on_comm_stream,
+        grad_output = grad_output.contiguous()
+        nvtx_msg = (
+            "moe.deepep.combine_backward.buffer_dispatch."
+            f"input_shape={tuple(grad_output.shape)}.group_size={ctx.group.size()}"
         )
+        nvtx_range_push(nvtx_msg)
+        try:
+            grad_x, _, _, _, _, after_event = buffer.dispatch(
+                grad_output,
+                handle=ctx.handle,
+                previous_event=previous_event,
+                async_finish=ctx.async_finish,
+                allocate_on_comm_stream=ctx.allocate_on_comm_stream,
+            )
+        finally:
+            nvtx_range_pop(nvtx_msg)
         # Make sure current stream is synchronized
         if ctx.async_finish:
             after_event.current_stream_wait()
@@ -463,23 +505,31 @@ class HybridEPDispatch(torch.autograd.Function):
         # wait for the data in pinned memory ready
         non_blocking = num_permuted_tokens is not None
         # Process the dispatch
-        (
-            dispatched_hidden,
-            dispatched_probs,
-            dispatched_scaling_factor,
-            tokens_per_expert,
-            handle,
-        ) = _hybrid_ep_buffer.dispatch_with_permute(
-            hidden=x,
-            routing_map=routing_map,
-            probs=probs,
-            scaling_factor=None,
-            num_of_experts_per_rank=num_local_experts,
-            pad_multiple=pad_multiple,
-            num_permuted_tokens=num_permuted_tokens,
-            non_blocking=non_blocking,
-            **({"fuse_permute_dispatch": fused} if fused else {}),
+        nvtx_msg = (
+            "moe.hybridep.dispatch.dispatch_with_permute."
+            f"input_shape={tuple(x.shape)}.group_size={group.size()}"
         )
+        nvtx_range_push(nvtx_msg)
+        try:
+            (
+                dispatched_hidden,
+                dispatched_probs,
+                dispatched_scaling_factor,
+                tokens_per_expert,
+                handle,
+            ) = _hybrid_ep_buffer.dispatch_with_permute(
+                hidden=x,
+                routing_map=routing_map,
+                probs=probs,
+                scaling_factor=None,
+                num_of_experts_per_rank=num_local_experts,
+                pad_multiple=pad_multiple,
+                num_permuted_tokens=num_permuted_tokens,
+                non_blocking=non_blocking,
+                **({"fuse_permute_dispatch": fused} if fused else {}),
+            )
+        finally:
+            nvtx_range_pop(nvtx_msg)
 
         ctx.handle = handle
         ctx.pad_multiple = pad_multiple
@@ -498,13 +548,21 @@ class HybridEPDispatch(torch.autograd.Function):
         Backward pass of fused dispatch of the HybridEP backend
         '''
         handle = ctx.handle
-        combined_hidden, combined_probs = _hybrid_ep_buffer.combine_with_unpermute(
-            hidden=grad_x,
-            probs=grad_probs,
-            handle=handle,
-            pad_multiple=ctx.pad_multiple,
-            **({"fuse_unpermute_combine": ctx.fused} if ctx.fused else {}),
+        nvtx_msg = (
+            "moe.hybridep.dispatch_backward.combine_with_unpermute."
+            f"input_shape={tuple(grad_x.shape)}"
         )
+        nvtx_range_push(nvtx_msg)
+        try:
+            combined_hidden, combined_probs = _hybrid_ep_buffer.combine_with_unpermute(
+                hidden=grad_x,
+                probs=grad_probs,
+                handle=handle,
+                pad_multiple=ctx.pad_multiple,
+                **({"fuse_unpermute_combine": ctx.fused} if ctx.fused else {}),
+            )
+        finally:
+            nvtx_range_pop(nvtx_msg)
         return (
             combined_hidden,
             None,
@@ -532,12 +590,17 @@ class HybridEPCombine(torch.autograd.Function):
         '''
         Forward pass of fused combine of the HybridEP backend
         '''
-        combined_hidden, _ = _hybrid_ep_buffer.combine_with_unpermute(
-            hidden=x,
-            handle=handle,
-            pad_multiple=pad_multiple,
-            **({"fuse_unpermute_combine": fused} if fused else {}),
-        )
+        nvtx_msg = f"moe.hybridep.combine.combine_with_unpermute.input_shape={tuple(x.shape)}"
+        nvtx_range_push(nvtx_msg)
+        try:
+            combined_hidden, _ = _hybrid_ep_buffer.combine_with_unpermute(
+                hidden=x,
+                handle=handle,
+                pad_multiple=pad_multiple,
+                **({"fuse_unpermute_combine": fused} if fused else {}),
+            )
+        finally:
+            nvtx_range_pop(nvtx_msg)
         ctx.handle = handle
         ctx.pad_multiple = pad_multiple
         ctx.num_permuted_tokens = num_permuted_tokens
@@ -550,14 +613,22 @@ class HybridEPCombine(torch.autograd.Function):
         Backward pass of fused combine of the HybridEP backend
         '''
         handle = ctx.handle
-        dispatched_hidden, _, _, _, _ = _hybrid_ep_buffer.dispatch_with_permute(
-            hidden=grad_x,
-            scaling_factor=None,
-            handle=handle,
-            pad_multiple=ctx.pad_multiple,
-            num_permuted_tokens=ctx.num_permuted_tokens,
-            **({"fuse_permute_dispatch": ctx.fused} if ctx.fused else {}),
+        nvtx_msg = (
+            "moe.hybridep.combine_backward.dispatch_with_permute."
+            f"input_shape={tuple(grad_x.shape)}"
         )
+        nvtx_range_push(nvtx_msg)
+        try:
+            dispatched_hidden, _, _, _, _ = _hybrid_ep_buffer.dispatch_with_permute(
+                hidden=grad_x,
+                scaling_factor=None,
+                handle=handle,
+                pad_multiple=ctx.pad_multiple,
+                num_permuted_tokens=ctx.num_permuted_tokens,
+                **({"fuse_permute_dispatch": ctx.fused} if ctx.fused else {}),
+            )
+        finally:
+            nvtx_range_pop(nvtx_msg)
         return dispatched_hidden, None, None, None, None
 
 
